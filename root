@@ -1,0 +1,1300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MotoNav - Motorcycle Navigation Prototype</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js"></script>
+    <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root">Loading Navigation App...</div>
+
+    <script type="text/babel">
+        /**
+         * MotoNav — Motorcycle Navigation Web App (Self-Contained)
+         * --------------------------------------------------------
+         * This code is wrapped in <script type="text/babel"> to be executed
+         * directly by the browser (via babel-standalone), making it run 
+         * without a separate build step, perfect for GitHub Pages.
+         * * MapLibre CSS is dynamically injected within the useEffect hook.
+         */
+        
+        const { useEffect, useMemo, useRef, useState } = React;
+        const maplibregl = window.maplibregl;
+        const SunCalc = window.SunCalc;
+        
+        // ---------- Types & Free API endpoints ----------
+
+        const OSRM = "https://router.project-osrm.org"; // routing (no key)
+        const NOMINATIM = "https://nominatim.openstreetmap.org/search"; // geocoding (no key)
+        const OPEN_METEO = "https://api.open-meteo.com/v1/forecast"; // weather (no key)
+        const OVERPASS = "https://overpass-api.de/api/interpreter"; // OSM queries (no key)
+        const RAINVIEWER_TILES =
+        "https://tilecache.rainviewer.com/v2/radar/now/256/{z}/{x}/{y}/2/1_1.png";
+
+        // Types (simplified for pure JS execution environment, but kept for context)
+        // type LatLng = { lat: number; lng: number };
+        // type Waypoint = { id: string; label: string; position: LatLng | null; };
+        // type ThemeKey = "default" | "ducati" | "ninja" | "bmw" | "harley" | "triumph";
+        // type RidePreset = "fastest" | "scenic" | "twisty" | "straight";
+
+        // ---------- Utilities ----------
+
+        const uuid = () => Math.random().toString(36).slice(2, 10);
+
+        function clamp(n, min, max) {
+            return Math.max(min, Math.min(max, n));
+        }
+
+        // Quick and dirty Haversine
+        function haversineKm(a, b) {
+            const R = 6371;
+            const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+            const dLon = ((b.lng - a.lng) * Math.PI) / 180;
+            const lat1 = (a.lat * Math.PI) / 180;
+            const lat2 = (b.lat * Math.PI) / 180;
+            const s =
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.sin(dLon / 2) * Math.sin(dLon / 2) *
+                Math.cos(lat1) *
+                Math.cos(lat2);
+            const c = 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+            return R * c;
+        }
+
+        // Simple polyline distance
+        function polylineKm(points) {
+            let d = 0;
+            for (let i = 1; i < points.length; i++) d += haversineKm(points[i - 1], points[i]);
+            return d;
+        }
+
+        // Build a playful, deterministic route polyline
+        function buildDemoRoute(a, b, preset) {
+            const dx = b.lng - a.lng;
+            const dy = b.lat - a.lat;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const k = { fastest: 0.05, straight: 0.01, scenic: 0.18, twisty: 0.32 }[preset];
+            const n = 32;
+            const pts = [];
+            for (let i = 0; i <= n; i++) {
+                const t = i / n;
+                const nx = -dy / len;
+                const ny = dx / len;
+                const wobble =
+                    Math.sin(
+                        t * Math.PI * (preset === "twisty" ? 6 : preset === "scenic" ? 3 : 1)
+                    ) * k;
+                const lat = a.lat + dy * t + ny * wobble;
+                const lng = a.lng + dx * t + nx * wobble;
+                pts.push({ lat, lng });
+            }
+            return pts;
+        }
+
+        function encodeRoute(points) {
+            return btoa(
+                JSON.stringify(
+                    points.map((p) => [Number(p.lat.toFixed(5)), Number(p.lng.toFixed(5))])
+                )
+            );
+        }
+        function decodeRoute(s) {
+            try {
+                const arr = JSON.parse(atob(s));
+                return arr.map(([lat, lng]) => ({ lat, lng }));
+            } catch {
+                return null;
+            }
+        }
+
+        // Sunrise/sunset (via suncalc)
+        function sunTimes(lat, lng, when = new Date()) {
+            // SunCalc is globally available from the CDN script
+            const t = SunCalc.getTimes(when, lat, lng);
+            return { sunrise: t.sunrise, sunset: t.sunset };
+        }
+
+        // Local storage helpers
+        const LS = { theme: "motonav_theme", medical: "motonav_medical" };
+
+        // Demo data
+        const DEMO_EVENTS = [
+            { id: uuid(), name: "Bike Night @ Wynwood", date: "2025-11-15", lat: 25.801, lng: -80.199, type: "meetup", },
+            { id: uuid(), name: "Track Day Homestead", date: "2025-12-02", lat: 25.449, lng: -80.452, type: "track", },
+            { id: uuid(), name: "ADV Camp – Ocala", date: "2025-12-11", lat: 29.187, lng: -82.14, type: "adv", },
+        ];
+
+        const DEMO_RIDERS = [
+            { id: uuid(), name: "Alex – Ninja 650", lat: 26.122, lng: -80.137 },
+            { id: uuid(), name: "Sam – MT‑07", lat: 25.7617, lng: -80.1918 },
+            { id: uuid(), name: "Jess – R NineT", lat: 28.5383, lng: -81.3792 },
+        ];
+
+        // ---------- Styles (CSS variables) ----------
+
+        const THEME_VARS = {
+            default: { "--brand": "#0ea5e9", "--accent": "#22c55e", "--bg": "#0b1220", "--panel": "#0f172a", "--text": "#e2e8f0", },
+            ducati: { "--brand": "#cc0000", "--accent": "#ffcf3a", "--bg": "#120b0b", "--panel": "#1b0f10", "--text": "#fce7e7", },
+            ninja: { "--brand": "#2ecc71", "--accent": "#1abc9c", "--bg": "#07150d", "--panel": "#0b2414", "--text": "#e8fff2", },
+            bmw: { "--brand": "#1c69d4", "--accent": "#9ad1ff", "--bg": "#0a0e14", "--panel": "#0f141c", "--text": "#e8f2ff", },
+            harley: { "--brand": "#ff6a00", "--accent": "#ffd166", "--bg": "#120d08", "--panel": "#1b140e", "--text": "#ffe9d6", },
+            triumph: { "--brand": "#00bb55", "--accent": "#77ffff", "--bg": "#081116", "--panel": "#0e1b22", "--text": "#e3fbff", },
+        };
+
+        const AppHeader = ({ theme, setTheme, onShare }) => (
+            <div className="flex items-center justify-between gap-3 px-4 py-3 bg-[var(--panel)]/90 backdrop-blur sticky top-0 z-50 shadow-lg">
+                <div className="flex items-center gap-3">
+                    <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-[var(--brand)] text-black font-extrabold shadow">
+                        🏍️
+                    </span>
+                    <div className="leading-tight">
+                        <div className="text-[var(--text)] font-semibold tracking-wide">MotoNav</div>
+                        <div className="text-xs text-[var(--text)]/70">Motorcycle‑first navigation</div>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <select
+                        className="bg-black/30 text-[var(--text)] text-sm px-2 py-1 rounded border border-white/10"
+                        value={theme}
+                        onChange={(e) => setTheme(e.target.value)}
+                        aria-label="Theme"
+                    >
+                        <option value="default">Default</option>
+                        <option value="ducati">Ducati Red</option>
+                        <option value="ninja">Ninja Green</option>
+                        <option value="bmw">BMW Blue</option>
+                        <option value="harley">Harley Orange</option>
+                        <option value="triumph">Triumph Teal</option>
+                    </select>
+                    <button
+                        onClick={onShare}
+                        className="px-3 py-1.5 rounded bg-[var(--brand)] text-black font-medium shadow hover:opacity-90"
+                        title="Share ride"
+                    >
+                        Share Ride
+                    </button>
+                </div>
+            </div>
+        );
+
+        const ControlPanel = ({
+            waypoints, setWaypoints, preset, setPreset, onSuggestRide,
+            onStartTracking, onStopTracking, tracking, sunrise, sunset,
+            rainAhead, fogAhead, onDownloadMaps,
+        }) => (
+            <div className="w-full lg:w-[420px] max-h-[calc(100dvh-56px)] overflow-auto bg-[var(--panel)] text-[var(--text)] p-4 border-r border-white/5">
+                {/* Addresses */}
+                <div className="space-y-2">
+                    <div className="text-sm uppercase tracking-wide text-[var(--text)]/60">
+                        Route
+                    </div>
+                    {waypoints.map((w, idx) => (
+                        <div key={w.id} className="flex gap-2 items-center">
+                            <span className="text-xs w-6 text-center rounded bg-white/10 py-1">
+                                {idx === 0 ? "A" : idx === waypoints.length - 1 ? "B" : idx}
+                            </span>
+                            <input
+                                className="flex-1 bg-black/30 px-3 py-2 rounded outline-none border border-white/10"
+                                placeholder={
+                                    idx === 0
+                                        ? "Start: click map or type lat,lng"
+                                        : idx === waypoints.length - 1
+                                            ? "Destination: click map or type lat,lng"
+                                            : "Stop (optional)"
+                                }
+                                value={w.label}
+                                onChange={(e) =>
+                                    setWaypoints((prev) =>
+                                        prev.map((p) =>
+                                            p.id === w.id ? { ...p, label: e.target.value } : p
+                                        )
+                                    )
+                                }
+                                onBlur={(e) => {
+                                    const m = e.target.value.match(
+                                        /(-?\d+\.?\d*),\s*(-?\d+\.?\d*)/
+                                    );
+                                    if (m) {
+                                        const lat = clamp(parseFloat(m[1]), -85, 85);
+                                        const lng = clamp(parseFloat(m[2]), -180, 180);
+                                        setWaypoints((prev) =>
+                                            prev.map((p) =>
+                                                p.id === w.id
+                                                    ? { ...p, position: { lat, lng } }
+                                                    : p
+                                            )
+                                        );
+                                    }
+                                }}
+                            />
+                            {waypoints.length > 2 &&
+                                idx !== waypoints.length - 1 &&
+                                idx !== 0 && (
+                                    <button
+                                        className="text-xs px-2 py-2 rounded bg-red-500/20 border border-red-500/30 hover:bg-red-500/30"
+                                        onClick={() =>
+                                            setWaypoints((prev) =>
+                                                prev.filter((p) => p.id !== w.id)
+                                            )
+                                        }
+                                        title="Remove stop"
+                                    >
+                                        ✕
+                                    </button>
+                                )}
+                        </div>
+                    ))}
+                    <div className="flex gap-2">
+                        <button
+                            className="px-3 py-2 rounded bg-white/10 border border-white/10 hover:bg-white/15"
+                            onClick={() =>
+                                setWaypoints((prev) => [
+                                    ...prev.slice(0, prev.length - 1),
+                                    {
+                                        id: uuid(),
+                                        label: "Stop: click map or type lat,lng",
+                                        position: null,
+                                    },
+                                    prev[prev.length - 1],
+                                ])
+                            }
+                        >
+                            + Add Stop
+                        </button>
+                        <button
+                            className="px-3 py-2 rounded bg-white/10 border border-white/10 hover:bg-white/15"
+                            onClick={onSuggestRide}
+                        >
+                            Suggest a Ride
+                        </button>
+                    </div>
+                </div>
+
+                {/* Presets */}
+                <div className="mt-5">
+                    <div className="text-sm uppercase tracking-wide text-[var(--text)]/60 mb-2">
+                        Routing Preset
+                    </div>
+                    <div className="grid grid-cols-4 gap-2">
+                        {([
+                            "fastest",
+                            "scenic",
+                            "twisty",
+                            "straight",
+                        ]).map((p) => (
+                            <button
+                                key={p}
+                                onClick={() => setPreset(p)}
+                                className={`px-2 py-2 rounded text-sm capitalize border transition ${
+                                    preset === p
+                                        ? "bg-[var(--brand)] text-black border-[var(--brand)]"
+                                        : "bg-white/10 border-white/10 hover:bg-white/15"
+                                }`}
+                            >
+                                {p}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                {/* Weather + status */}
+                <div className="mt-5 grid grid-cols-2 gap-3">
+                    <div
+                        className={`p-3 rounded border ${
+                            rainAhead
+                                ? "border-red-500/50 bg-red-500/10"
+                                : "border-white/10 bg-white/5"
+                        }`}
+                    >
+                        <div className="text-xs uppercase text-[var(--text)]/60">
+                            Rain Ahead
+                        </div>
+                        <div className="text-xl font-semibold">
+                            {rainAhead ? "Yes – Prepare" : "No"}
+                        </div>
+                        {rainAhead && (
+                            <div className="mt-2 text-sm text-[var(--text)]/80">
+                                Consider pulling over soon. Nearby gas stations suggested on map.
+                            </div>
+                        )}
+                    </div>
+                    <div
+                        className={`p-3 rounded border ${
+                            fogAhead
+                                ? "border-yellow-500/50 bg-yellow-500/10"
+                                : "border-white/10 bg-white/5"
+                        }`}
+                    >
+                        <div className="text-xs uppercase text-[var(--text)]/60">
+                            Fog Ahead
+                        </div>
+                        <div className="text-xl font-semibold">
+                            {fogAhead ? "Low Visibility" : "Clear"}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Sunrise/Sunset */}
+                <div className="mt-5 grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded border border-white/10 bg-white/5">
+                        <div className="text-xs uppercase text-[var(--text)]/60">
+                            Sunrise
+                        </div>
+                        <div className="text-lg font-semibold">
+                            {sunrise
+                                ? sunrise.toLocaleTimeString([], {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                })
+                                : "—"}
+                        </div>
+                    </div>
+                    <div className="p-3 rounded border border-white/10 bg-white/5">
+                        <div className="text-xs uppercase text-[var(--text)]/60">
+                            Sunset
+                        </div>
+                        <div className="text-lg font-semibold">
+                            {sunset
+                                ? sunset.toLocaleTimeString([], {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                })
+                                : "—"}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Tracking */}
+                <div className="mt-5 flex gap-2">
+                    {!tracking ? (
+                        <button
+                            onClick={onStartTracking}
+                            className="flex-1 px-3 py-2 rounded bg-[var(--brand)] text-black font-semibold shadow"
+                        >
+                            ▶ Start Ride
+                        </button>
+                    ) : (
+                        <button
+                            onClick={onStopTracking}
+                            className="flex-1 px-3 py-2 rounded bg-red-500 text-white font-semibold shadow"
+                        >
+                            ⏹ Stop Ride
+                        </button>
+                    )}
+                    <button
+                        onClick={onDownloadMaps}
+                        className="px-3 py-2 rounded bg-white/10 border border-white/10 hover:bg-white/15"
+                    >
+                        Offline Maps
+                    </button>
+                </div>
+
+                {/* Quick actions */}
+                <div className="mt-5 grid grid-cols-2 gap-2">
+                    <button className="px-3 py-2 rounded bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/30">
+                        Hazard Report (Voice)
+                    </button>
+                    <button className="px-3 py-2 rounded bg-rose-600/20 border border-rose-500/40 hover:bg-rose-600/30">
+                        SOS
+                    </button>
+                </div>
+
+                {/* Events & Riders */}
+                <div className="mt-6">
+                    <div className="text-sm uppercase tracking-wide text-[var(--text)]/60 mb-2">
+                        Nearby Riders
+                    </div>
+                    <div className="space-y-1 text-sm">
+                        {DEMO_RIDERS.map((r) => (
+                            <div
+                                key={r.id}
+                                className="px-3 py-2 rounded bg-white/5 border border-white/10"
+                            >
+                                {r.name}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+                <div className="mt-4">
+                    <div className="text-sm uppercase tracking-wide text-[var(--text)]/60 mb-2">
+                        Upcoming Events
+                    </div>
+                    <div className="space-y-1 text-sm">
+                        {DEMO_EVENTS.map((e) => (
+                            <div
+                                key={e.id}
+                                className="px-3 py-2 rounded bg-white/5 border border-white/10"
+                            >
+                                <div className="font-medium">{e.name}</div>
+                                <div className="text-[var(--text)]/70">{e.date}</div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="h-6" />
+            </div>
+        );
+
+        const MedicalCardModal = ({ open, setOpen }) => {
+            const [form, setForm] = useState(() => {
+                try {
+                    return (
+                        JSON.parse(localStorage.getItem(LS.medical) || "null") || {
+                            name: "", blood: "", allergies: "", meds: "", emergency: "",
+                        }
+                    );
+                } catch {
+                    return {
+                        name: "", blood: "", allergies: "", meds: "", emergency: "",
+                    };
+                }
+            });
+
+            useEffect(() => {
+                document.body.style.overflow = open ? "hidden" : "";
+            }, [open]);
+
+            if (!open) return null;
+
+            return (
+                <div
+                    className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4"
+                    role="dialog"
+                    aria-modal
+                >
+                    <div className="w-full max-w-xl bg-[var(--panel)] border border-white/10 rounded-xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <div className="text-lg font-semibold text-[var(--text)]">
+                                Emergency Medical Info
+                            </div>
+                            <button
+                                onClick={() => setOpen(false)}
+                                className="px-2 py-1 rounded bg-white/10"
+                            >
+                                ✕
+                            </button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            {(
+                                [
+                                    ["name", "Name"],
+                                    ["blood", "Blood Type"],
+                                    ["allergies", "Allergies"],
+                                    ["meds", "Medications"],
+                                    ["emergency", "Emergency Contact"],
+                                ]
+                            ).map(([key, label]) => (
+                                <div key={key} className="col-span-2 sm:col-span-1">
+                                    <div className="text-sm mb-1 text-[var(--text)]/80">{label}</div>
+                                    <input
+                                        className="w-full bg-black/30 px-3 py-2 rounded outline-none border border-white/10"
+                                        value={form[key]}
+                                        onChange={(e) =>
+                                            setForm((f) => ({ ...f, [key]: e.target.value }))
+                                        }
+                                    />
+                                </div>
+                            ))}
+                        </div>
+                        <div className="mt-4 flex gap-2 justify-end">
+                            <button
+                                onClick={() => setOpen(false)}
+                                className="px-3 py-2 rounded bg-white/10"
+                            >
+                                Close
+                            </button>
+                            <button
+                                onClick={() => {
+                                    localStorage.setItem(LS.medical, JSON.stringify(form));
+                                    setOpen(false);
+                                    alert("Medical info saved for SOS");
+                                }}
+                                className="px-3 py-2 rounded bg-[var(--brand)] text-black font-semibold"
+                            >
+                                Save
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ---------- Service Worker & Main Component ----------
+
+        // Helper: one-file Service Worker registration for GitHub Pages
+        function registerOneFileSW() {
+            if (!("serviceWorker" in navigator)) return;
+            const swCode = `
+                const PRECACHE = 'motonav-precache-v1';
+                const RUNTIME = 'motonav-runtime-v1';
+                self.addEventListener('install', (event) => {
+                    event.waitUntil((async () => {
+                        const cache = await caches.open(PRECACHE);
+                        // Precache minimal assets that are safe & static
+                        await cache.addAll([
+                            self.location.href,
+                            'https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css',
+                        ]);
+                    })());
+                    self.skipWaiting();
+                });
+                self.addEventListener('activate', (event) => {
+                    event.waitUntil((async () => {
+                        const keys = await caches.keys();
+                        await Promise.all(keys.filter(k => ![PRECACHE, RUNTIME].includes(k)).map(k => caches.delete(k)));
+                    })());
+                    self.clients.claim();
+                });
+
+                const API_HOSTS = ['router.project-osrm.org','nominatim.openstreetmap.org','api.open-meteo.com','overpass-api.de','tilecache.rainviewer.com','demotiles.maplibre.org'];
+
+                self.addEventListener('fetch', (event) => {
+                    const req = event.request;
+                    if (req.method !== 'GET') return;
+                    const url = new URL(req.url);
+                    // Cache strategy selection
+                    const isAPI = API_HOSTS.includes(url.hostname);
+                    const isMapTile = /\\.(pbf|mvt|png|jpg|jpeg|webp)$/i.test(url.pathname) || url.hostname.includes('tile') || url.pathname.includes('/tiles');
+
+                    if (isMapTile) {
+                        // Cache-first for tiles/radar
+                        event.respondWith((async () => {
+                            const cache = await caches.open(RUNTIME);
+                            const cached = await cache.match(req);
+                            if (cached) return cached;
+                            try {
+                                const res = await fetch(req, { mode: 'cors' });
+                                cache.put(req, res.clone());
+                                return res;
+                            } catch (e) {
+                                return cached || fetch(req);
+                            }
+                        })());
+                        return;
+                    }
+
+                    if (isAPI) {
+                        // Network-first with cache fallback for APIs
+                        event.respondWith((async () => {
+                            const cache = await caches.open(RUNTIME);
+                            try {
+                                const net = await fetch(req, { mode: 'cors' });
+                                cache.put(req, net.clone());
+                                return net;
+                            } catch (e) {
+                                const cached = await cache.match(req);
+                                return cached || new Response(JSON.stringify({ offline: true }), { headers: { 'Content-Type': 'application/json' } });
+                            }
+                        })());
+                        return;
+                    }
+
+                    // Default: try cache, then network
+                    event.respondWith((async () => {
+                        const cache = await caches.open(RUNTIME);
+                        const cached = await cache.match(req);
+                        if (cached) return cached;
+                        try {
+                            const net = await fetch(req);
+                            cache.put(req, net.clone());
+                            return net;
+                        } catch (e) {
+                            return cached || Response.error();
+                        }
+                    })());
+                });
+            `;
+            const blob = new Blob([swCode], { type: "text/javascript" });
+            const swUrl = URL.createObjectURL(blob);
+            navigator.serviceWorker.register(swUrl, { scope: "./" }).catch(() => {});
+        }
+
+
+        function MotoNavApp() {
+            const mapRef = useRef(null);
+            const mapNode = useRef(null);
+            const [mapReady, setMapReady] = useState(false);
+            const [theme, setTheme] = useState(
+                () => localStorage.getItem(LS.theme) || "default"
+            );
+
+            // Waypoints (A, [stops], B)
+            const [waypoints, setWaypoints] = useState([
+                { id: uuid(), label: "Start: click map or type lat,lng", position: null, },
+                { id: uuid(), label: "Destination: click map or type lat,lng", position: null, },
+            ]);
+
+            const [preset, setPreset] = useState("scenic");
+            const [route, setRoute] = useState(null);
+            const [tracking, setTracking] = useState(false);
+            const trackingPoints = useRef([]);
+
+            const [rainAhead, setRainAhead] = useState(false);
+            const [fogAhead, setFogAhead] = useState(false);
+
+            const [sunrise, setSunrise] = useState(undefined);
+            const [sunset, setSunset] = useState(undefined);
+            const [medicalOpen, setMedicalOpen] = useState(false);
+
+            // Apply theme vars
+            useEffect(() => {
+                const vars = THEME_VARS[theme] || THEME_VARS.default;
+                Object.entries(vars).forEach(([k, v]) =>
+                    document.documentElement.style.setProperty(k, v)
+                );
+                localStorage.setItem(LS.theme, theme);
+            }, [theme]);
+
+            // Initialize MapLibre (North America focus)
+            useEffect(() => {
+                if (mapRef.current || !mapNode.current) return;
+
+                // CRITICAL FIX FOR GITHUB PAGES: Dynamically inject MapLibre CSS
+                const cssId = "maplibre-css";
+                if (!document.getElementById(cssId)) {
+                    const link = document.createElement("link");
+                    link.id = cssId;
+                    link.rel = "stylesheet";
+                    link.href = "https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css";
+                    document.head.appendChild(link);
+                }
+                
+                // Register one-file SW for offline/runtime caching
+                registerOneFileSW();
+
+                const map = new maplibregl.Map({
+                    container: mapNode.current,
+                    style: "https://demotiles.maplibre.org/style.json",
+                    center: [-98.5, 39.5],
+                    zoom: 3.6,
+                    pitch: 60,
+                    bearing: 0,
+                    antialias: true,
+                    hash: true,
+                });
+
+                map.addControl(
+                    new maplibregl.NavigationControl({ visualizePitch: true }),
+                    "bottom-right"
+                );
+                map.addControl(
+                    new maplibregl.ScaleControl({ maxWidth: 120, unit: "imperial" })
+                );
+                mapRef.current = map;
+
+                // Style-specific resources (terrain, sky) — only after style is ready
+                map.on("style.load", () => {
+                    if (!map.getSource("terrain-dem")) {
+                        map.addSource("terrain-dem", {
+                            type: "raster-dem",
+                            url: "https://demotiles.maplibre.org/terrain-tiles/tiles.json",
+                            tileSize: 256,
+                        });
+                        map.setTerrain({
+                            source: "terrain-dem",
+                            exaggeration: 1.4,
+                        });
+                        map.addLayer({
+                            id: "sky",
+                            type: "sky",
+                            paint: {
+                                "sky-type": "atmosphere",
+                                "sky-atmosphere-sun": [0.0, 0.0],
+                                "sky-atmosphere-sun-intensity": 10,
+                            },
+                        });
+                    }
+                });
+
+                // Full map readiness (all sources/styles ready to mutate)
+                map.on("load", () => {
+                    setMapReady(true);
+
+                    // Simple animated weather mask (demo) — safe now that style is ready
+                    const weatherCanvas = document.createElement("canvas");
+                    weatherCanvas.width = weatherCanvas.height = 1024;
+                    const ctx = weatherCanvas.getContext("2d");
+                    const cells = Array.from({ length: 18 }).map(() => ({
+                        x: Math.random() * weatherCanvas.width,
+                        y: Math.random() * weatherCanvas.height,
+                        r: 20 + Math.random() * 80,
+                        type: Math.random() < 0.6 ? "rain" : "fog",
+                        a: 0.2 + Math.random() * 0.4,
+                        v: 0.3 + Math.random() * 0.8,
+                    }));
+                    function drawWeather() {
+                        ctx.clearRect(0, 0, weatherCanvas.width, weatherCanvas.height);
+                        for (const c of cells) {
+                            ctx.beginPath();
+                            const grad = ctx.createRadialGradient( c.x, c.y, 0, c.x, c.y, c.r );
+                            if (c.type === "rain") {
+                                grad.addColorStop(0, `rgba(80,150,255,${c.a})`);
+                                grad.addColorStop(1, "rgba(80,150,255,0)");
+                            } else {
+                                grad.addColorStop(0, `rgba(200,200,200,${c.a})`);
+                                grad.addColorStop(1, "rgba(200,200,200,0)");
+                            }
+                            ctx.fillStyle = grad;
+                            ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+                            ctx.fill();
+                            c.x += c.v;
+                            if (c.x - c.r > weatherCanvas.width) c.x = -c.r;
+                        }
+                    }
+                    map.addSource("weather-src", {
+                        type: "image",
+                        url: weatherCanvas.toDataURL(),
+                        coordinates: [
+                            [-167.275, 72.0], [-52.0, 72.0], [-52.0, 12.0], [-167.275, 12.0],
+                        ],
+                    });
+                    map.addLayer({
+                        id: "weather-layer",
+                        type: "raster",
+                        source: "weather-src",
+                        paint: { "raster-opacity": 0.3 },
+                    });
+                    (function tick() {
+                        drawWeather();
+                        const src = map.getSource("weather-src");
+                        if (src && src.updateImage) src.updateImage({ url: weatherCanvas.toDataURL() });
+                        requestAnimationFrame(tick);
+                    })();
+
+                    // Live radar tiles (RainViewer – free, no key)
+                    if (!map.getSource("radar-tiles")) {
+                        map.addSource("radar-tiles", {
+                            type: "raster",
+                            tiles: [RAINVIEWER_TILES],
+                            tileSize: 256,
+                            attribution: "RainViewer",
+                        });
+                        map.addLayer({
+                            id: "radar",
+                            type: "raster",
+                            source: "radar-tiles",
+                            paint: { "raster-opacity": 0.45 },
+                        });
+                    }
+                });
+
+                // Click to set nearest empty waypoint (or last dest)
+                map.on("click", (e) => {
+                    const target =
+                        waypoints.find((w) => !w.position) ||
+                        waypoints[waypoints.length - 1];
+                    setWaypoints((prev) =>
+                        prev.map((p) =>
+                            p.id === target.id
+                                ? {
+                                    ...p,
+                                    position: { lat: e.lngLat.lat, lng: e.lngLat.lng },
+                                    label: `${e.lngLat.lat.toFixed(5)}, ${e.lngLat.lng.toFixed(5)}`,
+                                }
+                                : p
+                        )
+                    );
+                });
+
+                return () => map.remove();
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [waypoints.length]); // Depend only on length to prevent unnecessary map setup
+
+            // Geocode labels to coordinates (Nominatim)
+            useEffect(() => {
+                waypoints.forEach((w) => {
+                    if (
+                        w.position ||
+                        !w.label ||
+                        /-?\d+\.?\d*\s*,\s*-?\d+\.?\d*/.test(w.label)
+                    )
+                        return;
+                    if (w.label.length < 4) return;
+                    const url = `${NOMINATIM}?q=${encodeURIComponent(
+                        w.label
+                    )}&format=json&limit=1`;
+                    fetch(url, { headers: { Accept: "application/json" } })
+                        .then((r) => r.json())
+                        .then((arr) => {
+                            if (arr && arr[0]) {
+                                const lat = clamp(parseFloat(arr[0].lat), -85, 85);
+                                const lng = clamp(parseFloat(arr[0].lon), -180, 180);
+                                setWaypoints((prev) =>
+                                    prev.map((p) =>
+                                        p.id === w.id
+                                            ? {
+                                                ...p,
+                                                position: { lat, lng },
+                                                label: arr[0].display_name,
+                                            }
+                                            : p
+                                    )
+                                );
+                            }
+                        })
+                        .catch(() => {});
+                });
+            // FIX: Use all waypoints and their labels as a stable dependency.
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [waypoints, waypoints.map((w) => w.label).join("|")]);
+
+            // Recompute route when waypoints/preset change (OSRM)
+            useEffect(() => {
+                const pts = waypoints
+                    .filter((w) => w.position)
+                    .map((w) => w.position);
+                if (pts.length >= 2) {
+                    const coords = pts.map((p) => `${p.lng},${p.lat}`).join(";");
+                    const url = `${OSRM}/route/v1/driving/${coords}?overview=full&geometries=geojson&alternatives=true&steps=false`;
+                    fetch(url)
+                        .then((r) => r.json())
+                        .then((data) => {
+                            if (!data || !data.routes || !data.routes.length) {
+                                setRoute(null);
+                                return;
+                            }
+                            const routes = data.routes;
+                            let chosen = routes[0];
+                            
+                            if (preset === "fastest")
+                                chosen = routes.sort(
+                                    (a, b) => a.duration - b.duration
+                                )[0];
+                            else if (preset === "straight")
+                                chosen = routes.sort(
+                                    (a, b) => a.distance - b.distance
+                                )[0];
+                            else if (preset === "scenic" || preset === "twisty")
+                                chosen =
+                                    routes.sort(
+                                        (a, b) =>
+                                            b.geometry.coordinates.length - a.geometry.coordinates.length
+                                    )[0] || routes[0];
+
+                            const pts2 = chosen.geometry.coordinates.map(
+                                (c) => ({ lng: c[0], lat: c[1] })
+                            );
+                            setRoute(pts2);
+                        })
+                        .catch(() => {
+                            // fallback to synthetic if OSRM unreachable
+                            const segs = [];
+                            for (let i = 0; i < pts.length - 1; i++) {
+                                const seg = buildDemoRoute(pts[i], pts[i + 1], preset);
+                                if (i > 0) seg.shift();
+                                segs.push(...seg);
+                            }
+                            setRoute(segs);
+                        });
+                } else setRoute(null);
+            }, [waypoints, preset]);
+
+            // Draw layers for route & waypoints — ONLY after mapReady
+            useEffect(() => {
+                const map = mapRef.current;
+                if (!map || !mapReady) return;
+
+                // Waypoints as symbols (safe update)
+                const wpGeo = {
+                    type: "FeatureCollection",
+                    features: waypoints
+                        .filter((w) => w.position)
+                        .map((w, i) => ({
+                            type: "Feature",
+                            properties: {
+                                label: i === 0 ? "A" : i === waypoints.length - 1 ? "B" : `${i}`,
+                            },
+                            geometry: {
+                                type: "Point",
+                                coordinates: [w.position.lng, w.position.lat],
+                            },
+                        })),
+                };
+
+                if (!map.getSource("waypoints")) {
+                    map.addSource("waypoints", { type: "geojson", data: wpGeo });
+                    map.addLayer({
+                        id: "waypoints-circle", type: "circle", source: "waypoints",
+                        paint: {
+                            "circle-radius": 6, "circle-color": "#00ffa8", "circle-stroke-color": "#001a12", "circle-stroke-width": 2,
+                        },
+                    });
+                    map.addLayer({
+                        id: "waypoints-label", type: "symbol", source: "waypoints",
+                        layout: { "text-field": ["get", "label"], "text-size": 12, "text-offset": [0, 1.2], },
+                        paint: { "text-color": "#fff" },
+                    });
+                } else {
+                    map.getSource("waypoints").setData(wpGeo);
+                }
+
+                // Route line
+                if (route && route.length > 1) {
+                    const geo = {
+                        type: "FeatureCollection",
+                        features: [{
+                            type: "Feature", properties: {},
+                            geometry: { type: "LineString", coordinates: route.map((p) => [p.lng, p.lat]), },
+                        }],
+                    };
+                    if (!map.getSource("route")) {
+                        map.addSource("route", { type: "geojson", data: geo });
+                        map.addLayer({
+                            id: "route-line", type: "line", source: "route",
+                            paint: { "line-color": "#00ffa8", "line-width": 5, "line-opacity": 0.9, },
+                        });
+                        map.addLayer({
+                            id: "route-casing", type: "line", source: "route",
+                            paint: { "line-color": "#003d2e", "line-width": 9, "line-opacity": 0.5, },
+                        }, "route-line");
+                    } else {
+                        map.getSource("route").setData(geo);
+                    }
+                    // Fit bounds (safe after load)
+                    const lats = route.map((p) => p.lat);
+                    const lngs = route.map((p) => p.lng);
+                    const bbox = [
+                        Math.min(...lngs), Math.min(...lats), Math.max(...lngs), Math.max(...lats),
+                    ];
+                    try {
+                        map.fitBounds(bbox, { padding: 60, duration: 800 });
+                    } catch {}
+                } else {
+                    if (map.getSource("route")) {
+                        (map.getStyle().layers || [])
+                            .filter((l) => l.id.startsWith("route-"))
+                            .forEach((l) => { try { map.removeLayer(l.id); } catch {} });
+                        try { map.removeSource("route"); } catch {}
+                    }
+                }
+            }, [route, waypoints, mapReady]);
+
+            // Weather alerts
+            useEffect(() => {
+                if (!mapReady || !route || route.length < 2) {
+                    setRainAhead(false);
+                    setFogAhead(false);
+                    return;
+                }
+                const picks = [ route[0], route[Math.floor(route.length / 2)], route[route.length - 1], ].filter(Boolean);
+                Promise.all(
+                    picks.map((p) =>
+                        fetch(
+                            `${OPEN_METEO}?latitude=${p.lat.toFixed(4)}&longitude=${p.lng.toFixed(
+                                4
+                            )}&current=precipitation,visibility`
+                        )
+                            .then((r) => r.json())
+                            .catch(() => null)
+                    )
+                ).then((arr) => {
+                    const rain = arr.some( (a) => (a?.current?.precipitation || 0) > 0.5 );
+                    const fog = arr.some( (a) => (a?.current?.visibility || 99999) < 2000 );
+                    setRainAhead(rain);
+                    setFogAhead(fog);
+                    if (rain) suggestFuelStops();
+                });
+            }, [route, mapReady]);
+
+            function suggestFuelStops() {
+                const map = mapRef.current;
+                if (!map || !mapReady || !route || route.length < 2) return;
+                const lats = route.map((p) => p.lat);
+                const lngs = route.map((p) => p.lng);
+                const south = Math.min(...lats); const north = Math.max(...lats);
+                const west = Math.min(...lngs); const east = Math.max(...lngs);
+                const bbox = `${south},${west},${north},${east}`;
+                const q = `[out:json][timeout:20];(node["amenity"="fuel"](${bbox});way["amenity"="fuel"](${bbox}););out center 50;`;
+                fetch(OVERPASS, { method: "POST", body: q, headers: { "Content-Type": "text/plain" }, })
+                    .then((r) => r.json())
+                    .then((data) => {
+                        const feats = (data.elements || [])
+                            .map((el) => {
+                                const lat = el.lat || (el.center && el.center.lat);
+                                const lon = el.lon || (el.center && el.center.lon);
+                                return lat && lon
+                                    ? {
+                                        type: "Feature", properties: { name: el.tags?.name || "Fuel" },
+                                        geometry: { type: "Point", coordinates: [lon, lat], },
+                                    }
+                                    : null;
+                            })
+                            .filter(Boolean);
+                        const geo = { type: "FeatureCollection", features: feats };
+                        if (!map.getSource("fuel")) {
+                            map.addSource("fuel", { type: "geojson", data: geo });
+                            map.addLayer({
+                                id: "fuel", type: "circle", source: "fuel",
+                                paint: { "circle-radius": 5, "circle-color": "#ffd166", "circle-stroke-color": "#7a4", "circle-stroke-width": 1, },
+                            });
+                        } else {
+                            map.getSource("fuel").setData(geo);
+                        }
+                    })
+                    .catch(() => {});
+            }
+
+            // Sunrise/sunset for center or waypoint A
+            useEffect(() => {
+                const center =
+                    waypoints.find((w) => w.position)?.position || { lat: 40.0, lng: -100.0, };
+                const { sunrise, sunset } = sunTimes(center.lat, center.lng, new Date());
+                setSunrise(sunrise);
+                setSunset(sunset);
+            }, [waypoints]);
+
+            // Geolocation for convenience
+            useEffect(() => {
+                if (!navigator.geolocation) return;
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        const { latitude: lat, longitude: lng } = pos.coords;
+                        if (!waypoints[0].position)
+                            setWaypoints((prev) =>
+                                prev.map((p, i) =>
+                                    i === 0
+                                        ? {
+                                            ...p, position: { lat, lng }, label: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+                                        }
+                                        : p
+                                )
+                            );
+                    }, () => {}
+                );
+            }, [waypoints]);
+
+            // Crash detection
+            useEffect(() => {
+                function onMotion(e) {
+                    if (!tracking) return;
+                    const a = e.accelerationIncludingGravity;
+                    if (!a) return;
+                    const mag = Math.sqrt(
+                        (a.x || 0) ** 2 + (a.y || 0) ** 2 + (a.z || 0) ** 2
+                    );
+                    if (mag > 40) {
+                        setTracking(false);
+                        alert("⚠️ Possible crash detected. SOS panel opening.");
+                        setMedicalOpen(true);
+                    }
+                }
+                window.addEventListener("devicemotion", onMotion);
+                return () => window.removeEventListener("devicemotion", onMotion);
+            }, [tracking]);
+
+            // Ride tracking
+            useEffect(() => {
+                let watchId = null;
+                if (tracking && navigator.geolocation) {
+                    watchId = navigator.geolocation.watchPosition(
+                        (p) => {
+                            trackingPoints.current.push({
+                                lat: p.coords.latitude, lng: p.coords.longitude,
+                            });
+                        }, () => {},
+                        { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 }
+                    );
+                }
+                return () => {
+                    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+                };
+            }, [tracking]);
+
+            // Offline maps hint
+            function onDownloadMaps() {
+                if ("caches" in window) {
+                    caches.open("motonav-offline").then((cache) => {
+                        cache.addAll([
+                            "https://demotiles.maplibre.org/style.json",
+                            "https://demotiles.maplibre.org/terrain-tiles/tiles.json",
+                        ]);
+                    });
+                    alert(
+                        "Queued core styles into Cache Storage. For full offline maps, add a Service Worker to cache vector tiles."
+                    );
+                } else {
+                    alert("Cache API not available in this environment.");
+                }
+            }
+
+            // Suggest a nearby loop ride
+            function onSuggestRide() {
+                const start = waypoints[0].position || { lat: 39.7392, lng: -104.9903, };
+                const d = 0.8;
+                const ring = [
+                    { lat: start.lat + d, lng: start.lng }, { lat: start.lat + d, lng: start.lng + d },
+                    { lat: start.lat, lng: start.lng + d }, { lat: start.lat - d, lng: start.lng + d / 2 },
+                    { lat: start.lat - d, lng: start.lng - d / 2 }, { lat: start.lat, lng: start.lng - d },
+                    { lat: start.lat + d / 2, lng: start.lng - d }, { lat: start.lat + d, lng: start.lng },
+                ];
+                setWaypoints([
+                    { id: uuid(), label: `A: ${start.lat.toFixed(5)}, ${start.lng.toFixed(5)}`, position: start, },
+                    { id: uuid(), label: "Scenic Loop", position: ring[3] },
+                    { id: uuid(), label: `B: ${start.lat.toFixed(5)}, ${start.lng.toFixed(5)}`, position: start, },
+                ]);
+                setPreset("twisty");
+            }
+
+            function onStartTracking() {
+                trackingPoints.current = [];
+                setTracking(true);
+            }
+            function onStopTracking() {
+                setTracking(false);
+                const pts = trackingPoints.current.slice();
+                if (pts.length > 1) {
+                    const km = polylineKm(pts);
+                    const miles = km * 0.621371;
+                    const durMin = Math.max(1, Math.round((pts.length * 3) / 60));
+                    alert(
+                        `Ride saved. Distance: ${miles.toFixed(
+                            1
+                        )} mi, Duration: ~${durMin} min`
+                    );
+                }
+            }
+
+            function onShare() {
+                const encoded = route ? encodeRoute(route) : "";
+                const url = new URL(window.location.href);
+                if (encoded) url.searchParams.set("route", encoded);
+                navigator.clipboard.writeText(url.toString());
+                alert("Share link copied to clipboard");
+            }
+
+            // Load route from URL if present
+            useEffect(() => {
+                const url = new URL(window.location.href);
+                const s = url.searchParams.get("route");
+                if (s) {
+                    const pts = decodeRoute(s);
+                    if (pts && pts.length > 1) setRoute(pts);
+                }
+            }, []);
+
+            // Compute basic analytics for current route (distance)
+            const routeMiles = useMemo(
+                () => (route ? (polylineKm(route) * 0.621371).toFixed(1) : "0.0"),
+                [route]
+            );
+
+            // --------- Component Render ---------
+
+            return (
+                <div className="w-full h-[100dvh] bg-[var(--bg)] text-[var(--text)]">
+                    <AppHeader theme={theme} setTheme={setTheme} onShare={onShare} />
+
+                    <div className="flex w-full h-[calc(100dvh-56px)]">
+                        {/* Left controls */}
+                        <ControlPanel
+                            waypoints={waypoints}
+                            setWaypoints={setWaypoints}
+                            preset={preset}
+                            setPreset={setPreset}
+                            onSuggestRide={onSuggestRide}
+                            onStartTracking={onStartTracking}
+                            onStopTracking={onStopTracking}
+                            tracking={tracking}
+                            sunrise={sunrise}
+                            sunset={sunset}
+                            rainAhead={rainAhead}
+                            fogAhead={fogAhead}
+                            onDownloadMaps={onDownloadMaps}
+                        />
+
+                        {/* Map */}
+                        <div className="flex-1 relative">
+                            <div ref={mapNode} className="absolute inset-0" />
+
+                            {/* Overlay HUD */}
+                            <div className="absolute top-3 left-3 flex gap-2 items-center">
+                                <div className="px-3 py-2 rounded-xl bg-black/50 backdrop-blur border border-white/10 shadow">
+                                    <div className="text-xs uppercase text-[var(--text)]/60">
+                                        Preset
+                                    </div>
+                                    <div className="font-semibold capitalize">{preset}</div>
+                                </div>
+                                <div className="px-3 py-2 rounded-xl bg-black/50 backdrop-blur border border-white/10 shadow">
+                                    <div className="text-xs uppercase text-[var(--text)]/60">
+                                        Route
+                                    </div>
+                                    <div className="font-semibold">
+                                        {route ? `${routeMiles} mi` : "—"}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Right‑side quick buttons */}
+                            <div className="absolute top-3 right-3 flex flex-col gap-2">
+                                <button
+                                    onClick={() => setMedicalOpen(true)}
+                                    className="px-3 py-2 rounded bg-rose-500 text-white font-semibold shadow"
+                                    title="Emergency Medical Card / SOS"
+                                >
+                                    SOS / Med Card
+                                </button>
+                                <a
+                                    href="https://discord.com/new"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="px-3 py-2 rounded bg-[#5865F2] text-white font-semibold shadow text-center"
+                                    title="Open Discord Group"
+                                >
+                                    Discord
+                                </a>
+                                <a
+                                    href="https://wa.me/"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="px-3 py-2 rounded bg-green-500 text-black font-semibold shadow text-center"
+                                    title="Open WhatsApp Group"
+                                >
+                                    WhatsApp
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+
+                    <MedicalCardModal open={medicalOpen} setOpen={setMedicalOpen} />
+
+                    {/* Global Styles */}
+                    <style>{`
+                        /* Default CSS variables for Tailwind to use before the theme loads */
+                        :root { ${Object.entries(THEME_VARS.default)
+                            .map(([k, v]) => `${k}:${v};`)
+                            .join(" ")} }
+                        
+                        /* Reset and Base Styles */
+                        * { box-sizing: border-box; }
+                        html, body, #root { height: 100%; }
+                        body {
+                            margin: 0;
+                            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI,
+                                Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji",
+                                "Segoe UI Emoji";
+                        }
+                        .shadow { box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+                        
+                        /* Fixes for MapLibre controls when using dynamic loading */
+                        .maplibregl-ctrl-group {
+                            box-shadow: 0 10px 30px rgba(0,0,0,.35) !important;
+                            border-radius: 0.5rem !important;
+                        }
+                    `}</style>
+                </div>
+            );
+        }
+
+        // Render the application once the DOM and scripts are available
+        ReactDOM.createRoot(document.getElementById('root')).render(<MotoNavApp />);
+    </script>
+</body>
+</html>
